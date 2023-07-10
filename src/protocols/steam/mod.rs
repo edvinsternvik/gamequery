@@ -1,7 +1,7 @@
 mod types;
 
 use crate::misc::*;
-use std::net::UdpSocket;
+use std::{net::UdpSocket, vec::IntoIter};
 use types::{Environment, Player, Rule, ServerType};
 
 #[derive(Debug)]
@@ -26,8 +26,7 @@ impl A2SInfo {
         let req_buf_init: [u8; 25] = *b"\xFF\xFF\xFF\xFF\x54Source Engine Query\x00";
         let mut req_buf: [u8; 29] = *b"\xFF\xFF\xFF\xFF\x54Source Engine Query\x00\xFF\xFF\xFF\xFF";
 
-        let res_buf = a2s(socket, &req_buf_init, &mut req_buf, 0x49)?;
-        let mut data = res_buf.into_iter().skip(5);
+        let mut data = a2s(socket, &req_buf_init, &mut req_buf, 0x49)?.into_iter();
 
         Ok(A2SInfo {
             protocol: u8::next_data_le(&mut data).ok_or(ServerQueryError::InvalidData)?,
@@ -59,14 +58,17 @@ impl A2SPlayer {
         let req_buf_init: [u8; 9] = *b"\xFF\xFF\xFF\xFF\x55\xFF\xFF\xFF\xFF";
         let mut req_buf: [u8; 9] = *b"\xFF\xFF\xFF\xFF\x55\xFF\xFF\xFF\xFF";
 
-        let res_buf = a2s(socket, &req_buf_init, &mut req_buf, 0x44)?;
-        let mut data = res_buf.into_iter().skip(5);
+        let mut data = a2s(socket, &req_buf_init, &mut req_buf, 0x44)?;
 
         let num_players = u8::next_data_le(&mut data).ok_or(ServerQueryError::InvalidData)?;
         let mut players = Vec::new();
-        for _ in 0..num_players {
-            let player = Player::next_data_le(&mut data).ok_or(ServerQueryError::InvalidData)?;
-            players.push(player);
+        for _ in 0..num_players as usize {
+            if let Some(player) = Player::next_data_le(&mut data) {
+                players.push(player);
+            } else {
+                println!("Warning: Could not read all players");
+                break;
+            }
         }
 
         Ok(A2SPlayer { players })
@@ -74,26 +76,30 @@ impl A2SPlayer {
 }
 
 #[derive(Debug)]
-pub struct A2Rules {
+pub struct A2SRules {
     pub rules: Vec<Rule>,
 }
 
-impl A2Rules {
-    pub fn query(socket: &UdpSocket) -> Result<A2Rules, ServerQueryError> {
+impl A2SRules {
+    pub fn query(socket: &UdpSocket) -> Result<A2SRules, ServerQueryError> {
         let req_buf_init: [u8; 9] = *b"\xFF\xFF\xFF\xFF\x56\xFF\xFF\xFF\xFF";
         let mut req_buf: [u8; 9] = *b"\xFF\xFF\xFF\xFF\x56\xFF\xFF\xFF\xFF";
 
-        let res_buf = a2s(socket, &req_buf_init, &mut req_buf, 0x45)?;
-        let mut data = res_buf.into_iter().skip(5);
+        let mut data = a2s(socket, &req_buf_init, &mut req_buf, 0x45)?;
 
         let mut rules = Vec::new();
         let num_rules = u8::next_data_le(&mut data).ok_or(ServerQueryError::InvalidData)?;
         for _ in 0..num_rules {
-            let rule = Rule::next_data_le(&mut data).ok_or(ServerQueryError::InvalidData)?;
-            rules.push(rule);
+            if let Some(rule) = Rule::next_data_le(&mut data) {
+                rules.push(rule);
+            }
+            else {
+                println!("Warning: Could not read all rules");
+                break;
+            }
         }
 
-        Ok(A2Rules { rules })
+        Ok(A2SRules { rules })
     }
 }
 
@@ -111,34 +117,124 @@ fn a2s(
     first_req: &[u8],
     req_buf: &mut [u8],
     res_header: u8,
-) -> Result<[u8; 1400], ServerQueryError> {
-    let mut res_buf: [u8; 1400] = [0; 1400];
-    let offset = 4;
-
+) -> Result<IntoIter<u8>, ServerQueryError> {
     socket
         .send(&first_req)
         .map_err(ServerQueryError::CouldNotSend)?;
 
-    socket
-        .recv(&mut res_buf)
-        .map_err(ServerQueryError::CouldNotReceive)?;
+    let mut bytes = receive_bytes(socket)?;
 
     // The server returned a challenge
-    if res_buf[offset] == 0x41 {
-        set_challenge(req_buf, &res_buf[offset + 1..offset + 5]);
+    while bytes.len() >= 5 && bytes[0] == 0x41 {
+        set_challenge(req_buf, &bytes[1..5]);
 
         socket
             .send(&req_buf)
             .map_err(ServerQueryError::CouldNotSend)?;
 
-        socket
-            .recv(&mut res_buf)
-            .map_err(ServerQueryError::CouldNotReceive)?;
+        bytes = receive_bytes(socket)?;
     }
 
-    if res_buf[offset] != res_header {
+    if bytes.is_empty() || bytes[0] != res_header {
+        println!("ABC: {:x}", bytes[0]);
         return Err(ServerQueryError::InvalidData);
     }
 
-    Ok(res_buf)
+    let mut it = bytes.into_iter();
+    it.next();
+
+    Ok(it)
+}
+
+fn receive_bytes(socket: &UdpSocket) -> Result<Vec<u8>, ServerQueryError> {
+    let mut res_buf: [u8; 1400] = [0; 1400];
+    let bytes: Vec<u8>;
+
+    socket
+        .recv(&mut res_buf)
+        .map_err(ServerQueryError::CouldNotReceive)?;
+
+    let mut data = res_buf.into_iter();
+    let header = i32::next_data_le(&mut data).ok_or(ServerQueryError::InvalidData)?;
+
+    // Multi-packet response
+    if header == -2 {
+        let first_packet =
+            Multipacket::next_data_le(&mut data).ok_or(ServerQueryError::InvalidData)?;
+
+        let mut packets = vec![Vec::<u8>::new(); first_packet.total as usize];
+        packets[first_packet.number as usize] = first_packet.payload;
+
+        for _ in 1..first_packet.total as usize {
+            socket
+                .recv(&mut res_buf)
+                .map_err(ServerQueryError::CouldNotReceive)?;
+
+            data = res_buf.into_iter();
+            let header = i32::next_data_le(&mut data).ok_or(ServerQueryError::InvalidData)?;
+
+            if header != -2 {
+                return Err(ServerQueryError::InvalidData);
+            }
+
+            let packet =
+                Multipacket::next_data_le(&mut data).ok_or(ServerQueryError::InvalidData)?;
+
+            packets[packet.number as usize] = packet.payload;
+        }
+
+        bytes = packets.into_iter().flatten().collect();
+    } else {
+        bytes = data.collect();
+    }
+
+    Ok(bytes)
+}
+
+struct Multipacket {
+    _id: i32,
+    total: u8,
+    number: u8,
+    _max_packet_size: i16,
+    _size: Option<i32>,
+    _crc32_sum: Option<i32>,
+    payload: Vec<u8>,
+}
+
+impl FromBytestream for Multipacket {
+    fn next_data_le(bytes: &mut impl Iterator<Item = u8>) -> Option<Self> {
+        let id_field = i32::next_data_le(bytes)?;
+        let _id = id_field & 0x7FFFFFFF;
+        let compressed = (id_field & 80000000) != 0;
+        let total = u8::next_data_le(bytes)?;
+        let number = u8::next_data_le(bytes)?;
+
+        // Warning: Some older games does not have this field
+        let _max_packet_size = i16::next_data_le(bytes)?;
+
+        let (_size, _crc32_sum) = (None, None);
+
+        if _id == 0 && compressed {
+            println!("ERROR: Compressed packets are not suppored");
+            return None;
+        }
+
+        let mut payload: Vec<u8> = bytes.collect();
+        
+        // Some games put the single packet header in multi packet payload.
+        // If that is the case, then we want to remove it
+        if payload.len() >= 4 && payload[0..4] == *b"\xFF\xFF\xFF\xFF" {
+            payload = payload[4..].to_vec();
+        }
+
+        Some(Multipacket {
+            _id,
+            total,
+            number,
+            _max_packet_size,
+            _size,
+            _crc32_sum,
+            payload,
+        })
+    }
 }
